@@ -1,0 +1,6 @@
+https://pkpbzthkwskkudqogyrl.supabase.co
+sb_publishable_MOHaPhKPaA_4Gb7ZMgxQgg_I4YNNk_w
+postgresql://postgres:[YOUR-PASSWORD]@db.pkpbzthkwskkudqogyrl.supabase.co:5432/postgres
+supabase login
+supabase init
+supabase link --project-ref pkpbzthkwskkudqogyrl

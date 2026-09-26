@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Submission Tracker</title>
+  <link rel="shortcut icon" href="favicon.ico" type="image/x-icon">
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.js"></script>
+  <link rel="stylesheet" href="./status-styles.css">
+</head>
+
+<body>
+  <div class="wrap">
+
+    <header class="top">
+      <div>
+        <img class="hero-img" src="./yoobee-light.svg" alt="yoobee logo">
+        <h1>Submission Tracker</h1>
+        <p>Submission means you have submitted something to Blackboard.<br>Does not mean the submission is 100%
+          complete or correct.</p>
+
+        <p class="sub">Tick a box when you have submitted. Saved instantly — visible on every machine.</p>
+      </div>
+      <div class="status">
+        <span class="dot load" id="statusDot"></span>
+        <span id="statusText">Connecting…</span>
+      </div>
+    </header>
+
+    <section class="who" id="whoBox" hidden>
+      <span class="label" for="whoSelect">I am</span>
+      <select id="whoSelect" aria-label="Select your name">
+        <option value="">— choose your name —</option>
+      </select>
+      <span class="hint" id="whoHint"></span>
+    </section>
+
+    <section class="summary" id="summaryBox" hidden>
+      <div>
+        <div class="cap">Overall progress</div>
+        <div class="big"><span id="overallDone">0</span> <span>/ <span id="overallTotal">0</span> submitted</span></div>
+      </div>
+      <div class="bar"><i id="overallBar"></i></div>
+      <button type="button" id="reload">Refresh</button>
+    </section>
+
+    <section class="card">
+      <div id="stateBox" class="state">
+        <h2>Loading the tracker…</h2>
+        <p>Fetching students, modules and submissions.</p>
+        <div class="bar-anim"><i></i></div>
+      </div>
+
+      <div id="gridBox" hidden>
+        <div class="scroll">
+          <table>
+            <thead id="thead"></thead>
+            <tbody id="tbody"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <footer class="foot" id="foot" hidden>
+      <span id="footLeft"></span>
+      <span id="footRight"></span>
+    </footer>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+    (function () {
+      "use strict";
+
+      /* ======================= configuration ======================= */
+
+      const SUPABASE_URL = "https://pkpbzthkwskkudqogyrl.supabase.co";
+      const SUPABASE_KEY = "sb_publishable_MOHaPhKPaA_4Gb7ZMgxQgg_I4YNNk_w";
+      const RPC = "set_submission";   // the only permitted write path
+      const ME_KEY = "submissionTracker.me";// for localStorage only. WHY ?
+
+      /* =========================== helpers ========================= */
+
+      const $ = (id) => document.getElementById(id);
+
+      const esc = (v) => String(v == null ? "" : v)
+        .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+
+      const key = (sid, aid) => sid + "|" + aid;
+
+      function setStatus(text, kind) {
+        $("statusText").textContent = text;
+        $("statusDot").className = "dot" + (kind ? " " + kind : "");
+      }
+
+      let toastTimer = null;
+      function toast(msg) {
+        const el = $("toast");
+        el.textContent = msg;
+        el.classList.add("show");
+        clearTimeout(toastTimer);
+        toastTimer = setTimeout(() => el.classList.remove("show"), 4200);
+      }
+
+      function fmtWhen(iso) {
+        if (!iso) return "";
+        const d = new Date(iso);
+        if (isNaN(d)) return "";
+        return d.toLocaleString(undefined, {
+          day: "numeric", month: "short", hour: "2-digit", minute: "2-digit"
+        });
+      }
+
+      /* ============================ state ========================== */
+
+      const state = {
+        students: [],
+        modules: [],
+        assignments: [],
+        progress: new Map(),   // "sid|aid" -> { submitted, submitted_at }
+        me: null,              // student id (number) or null
+        saving: new Set(),
+        client: null
+      };
+
+      /* ========================== data load ======================== */
+
+      function client() {
+        if (!state.client) {
+          state.client = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY, {
+            auth: { persistSession: false, autoRefreshToken: false }
+          });
+        }
+        return state.client;
+      }
+
+      async function load() {
+        $("reload").disabled = true;
+        $("stateBox").hidden = false;
+        $("stateBox").innerHTML =
+          '<h2>Loading the tracker…</h2>' +
+          '<p>Fetching students, modules and submissions.</p>' +
+          '<div class="bar-anim"><i></i></div>';
+        $("gridBox").hidden = true;
+        $("whoBox").hidden = true;
+        $("summaryBox").hidden = true;
+        $("foot").hidden = true;
+        setStatus("Loading…", "load");
+
+        try {
+          if (!window.supabase || typeof window.supabase.createClient !== "function") {
+            throw new Error("supabase-js failed to load from the CDN. Check your internet connection.");
+          }
+
+          const c = client();
+          const [st, mo, as, pr] = await Promise.all([
+            c.from("students").select("*").order("sort_order").order("id"),
+            c.from("modules").select("*").order("sort_order").order("id"),
+            c.from("assignments").select("*").order("sequence").order("id"),
+            c.from("progress").select("*")
+          ]);
+
+          const firstErr = [st, mo, as, pr].find((r) => r.error);
+          if (firstErr) throw firstErr.error;
+
+          state.students = st.data || [];
+          state.modules = mo.data || [];
+          state.assignments = as.data || [];
+
+          state.progress = new Map();
+          for (const row of (pr.data || [])) {
+            state.progress.set(key(row.student_id, row.assignment_id), {
+              submitted: row.submitted,
+              submitted_at: row.submitted_at
+            });
+          }
+
+          if (!state.students.length || !state.assignments.length) {
+            setStatus("No data yet", "");
+            $("stateBox").innerHTML =
+              '<h2>Connected — but there is nothing to show</h2>' +
+              '<p>Found <code>' + state.students.length + '</code> students and <code>' +
+              state.assignments.length + '</code> assignments. Run <code>status_schema.sql</code> ' +
+              'in the Supabase SQL editor to create and seed the tables.</p>';
+            return;
+          }
+
+          // Restore "I am" from this machine, if that student still exists.
+          let saved = null;
+          try { saved = localStorage.getItem(ME_KEY); } catch (e) { /* private mode */ }
+          state.me = (saved && state.students.some((s) => String(s.id) === saved))
+            ? Number(saved) : null;
+
+          buildWho();
+          render();
+          $("stateBox").hidden = true;
+          $("gridBox").hidden = false;
+          $("whoBox").hidden = false;
+          $("summaryBox").hidden = false;
+          $("foot").hidden = false;
+          setStatus("connected : https://supabase.com  · " + (state.students.length * state.assignments.length) + " cells", "live");
+        } catch (err) {
+          console.error(err);
+          showError(err);
+        } finally {
+          $("reload").disabled = false;
+        }
+      }
+
+      function showError(err) {
+        setStatus("Connection failed", "err");
+        const missing = err && (err.code === "PGRST205" || err.code === "42P01");
+        $("stateBox").hidden = false;
+        $("gridBox").hidden = true;
+        $("whoBox").hidden = true;
+        $("summaryBox").hidden = true;
+        $("foot").hidden = true;
+        $("stateBox").innerHTML =
+          "<h2>" + (missing ? "The tracker tables do not exist yet" : "Could not load the tracker") + "</h2>" +
+          "<p>" + (missing
+            ? "Run <code>status_schema.sql</code> in the Supabase SQL editor, then press Refresh."
+            : esc(err && err.message ? err.message : String(err))) + "</p>" +
+          "<pre>" + esc([
+            "url   : " + SUPABASE_URL,
+            err && err.code ? "code  : " + err.code : "",
+            err && err.details ? "details: " + err.details : "",
+            err && err.hint ? "hint  : " + err.hint : ""
+          ].filter(Boolean).join("\n")) + "</pre>";
+      }
+
+      /* =========================== rendering ======================= */
+
+      function buildWho() {
+        $("whoSelect").innerHTML = '<option value="">— choose your name —</option>' +
+          state.students.map((s) =>
+            '<option value="' + s.id + '">' + esc(s.full_name) + "</option>").join("");
+        $("whoSelect").value = state.me == null ? "" : String(state.me);
+        updateWhoHint();
+      }
+
+      function updateWhoHint() {
+        const h = $("whoHint");
+        if (state.me == null) {
+          h.className = "hint warn";
+          h.innerHTML = "Choose your name to start ticking. Everyone can see the whole grid.";
+        } else {
+          const s = state.students.find((x) => x.id === state.me);
+          h.className = "hint";
+          h.innerHTML = "You can only tick <strong>" + esc(s ? s.full_name : "") +
+            "</strong>'s row. Other rows are read-only.";
+        }
+      }
+
+      function countDone(sid) {
+        let n = 0;
+        for (const a of state.assignments) {
+          const p = state.progress.get(key(sid, a.id));
+          if (p && p.submitted) n++;
+        }
+        return n;
+      }
+
+      function render() {
+        const byModule = new Map();
+        for (const m of state.modules) byModule.set(m.id, []);
+        for (const a of state.assignments) {
+          if (!byModule.has(a.module_id)) byModule.set(a.module_id, []);
+          byModule.get(a.module_id).push(a);
+        }
+
+        // ---- header ----
+        let head = "<tr><th class='sticky' rowspan='2' style='text-align:left'>Student</th>";
+        for (const m of state.modules) {
+          const n = (byModule.get(m.id) || []).length;
+          if (n) head += "<th class='mod' colspan='" + n + "'>" + esc(m.title) + "</th>";
+        }
+        head += "<th rowspan='2'>Done</th></tr><tr>";
+        for (const m of state.modules) {
+          for (const a of (byModule.get(m.id) || [])) {
+            head += "<th title='" + esc(a.title) + "'>" + esc(a.title) + "</th>";
+          }
+        }
+        head += "</tr>";
+        $("thead").innerHTML = head;
+
+        // ---- body ----
+        const rows = [];
+        for (const s of state.students) {
+          const mine = state.me === s.id;
+          rows.push("<tr class='" + (mine ? "mine" : "") + "'>");
+          rows.push("<td class='sticky'><div class='who-cell'><span>" + esc(s.full_name) +
+            "</span>" + (mine ? "<span class='you'>You</span>" : "") + "</div></td>");
+
+          for (const m of state.modules) {
+            for (const a of (byModule.get(m.id) || [])) {
+              const p = state.progress.get(key(s.id, a.id));
+              const on = !!(p && p.submitted);
+              const when = on && p.submitted_at ? fmtWhen(p.submitted_at) : "";
+              rows.push(
+                "<td class='cell'>" +
+                "<input type='checkbox' class='cb'" +
+                " data-sid='" + s.id + "' data-aid='" + a.id + "'" +
+                (on ? " checked" : "") +
+                (mine ? "" : " disabled") +
+                " title='" + esc((on ? "Submitted " + when : "Not submitted yet")) + "'" +
+                " aria-label='" + esc(s.full_name + " — " + m.title + " " + a.title) + "' />" +
+                "</td>");
+            }
+          }
+
+          const done = countDone(s.id);
+          const all = state.assignments.length;
+          rows.push("<td class='done" + (done === all ? " full" : "") + "'>" + done + "/" + all + "</td>");
+          rows.push("</tr>");
+        }
+        $("tbody").innerHTML = rows.join("");
+
+        // ---- summary ----
+        const total = state.students.length * state.assignments.length;
+        let done = 0;
+        for (const s of state.students) done += countDone(s.id);
+        $("overallDone").textContent = done;
+        $("overallTotal").textContent = total;
+        $("overallBar").style.width = total ? (done / total * 100) + "%" : "0%";
+
+        // $("footLeft").textContent = "Only your own row is editable.";
+        // $("footRight").textContent = "Click Refresh to see other people's changes.";
+      }
+
+      /* ========================== interaction ====================== */
+
+      async function toggle(input) {
+        const sid = Number(input.dataset.sid);
+        const aid = Number(input.dataset.aid);
+        const next = input.checked;
+        const k = key(sid, aid);
+
+        if (state.saving.has(k)) return;
+        state.saving.add(k);
+        input.classList.add("saving");
+        input.disabled = true;
+
+        const prev = state.progress.get(k);
+
+        // Optimistic: reflect it immediately, then confirm with the database.
+        state.progress.set(k, {
+          submitted: next,
+          submitted_at: next ? new Date().toISOString() : null
+        });
+        refreshCounts();
+
+        try {
+          const { data, error } = await client().rpc(RPC, {
+            p_student_id: sid,
+            p_assignment_id: aid,
+            p_submitted: next
+          });
+          if (error) throw error;
+
+          // Trust the database's timestamps over our optimistic guess.
+          const row = Array.isArray(data) ? data[0] : data;
+          if (row && typeof row === "object") {
+            state.progress.set(k, {
+              submitted: !!row.submitted,
+              submitted_at: row.submitted_at || null
+            });
+            input.checked = !!row.submitted;
+          }
+          input.title = next
+            ? "Submitted " + fmtWhen((state.progress.get(k) || {}).submitted_at)
+            : "Not submitted yet";
+        } catch (err) {
+          console.error(err);
+          // Roll back the optimistic change.
+          if (prev) state.progress.set(k, prev);
+          else state.progress.delete(k);
+          input.checked = !next;
+          toast("Could not save: " + (err && err.message ? err.message : "unknown error"));
+        } finally {
+          state.saving.delete(k);
+          input.classList.remove("saving");
+          input.disabled = state.me !== sid;
+          refreshCounts();
+        }
+      }
+
+      function refreshCounts() {
+        const total = state.students.length * state.assignments.length;
+        let done = 0;
+        const rows = $("tbody").querySelectorAll("tr");
+        state.students.forEach((s, i) => {
+          const d = countDone(s.id);
+          done += d;
+          const cell = rows[i] && rows[i].querySelector("td.done");
+          if (cell) {
+            cell.textContent = d + "/" + state.assignments.length;
+            cell.classList.toggle("full", d === state.assignments.length);
+          }
+        });
+        $("overallDone").textContent = done;
+        $("overallBar").style.width = total ? (done / total * 100) + "%" : "0%";
+      }
+
+      function wire() {
+        $("whoSelect").addEventListener("change", (e) => {
+          const v = e.target.value;
+          state.me = v ? Number(v) : null;
+          try {
+            if (v) localStorage.setItem(ME_KEY, v);
+            else localStorage.removeItem(ME_KEY);
+          } catch (err) { /* private mode: selection just won't persist */ }
+          updateWhoHint();
+          render();
+        });
+
+        $("tbody").addEventListener("change", (e) => {
+          if (e.target.classList.contains("cb")) toggle(e.target);
+        });
+
+        $("reload").addEventListener("click", load);
+      }
+
+      wire();
+      load();
+    })();
+  </script>
+</body>
+
+</html>
